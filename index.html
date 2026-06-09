@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agenda Eletrônica CRM</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <main id="authView" class="auth-view">
+        <section class="panel auth-panel auth-card">
+          <div class="panel-header auth-header">
+            <div>
+              <h2 id="authTitle">Criar conta</h2>
+              <p id="authSubtitle">Cadastre-se com telefone e senha para acessar sua agenda.</p>
+            </div>
+            <div class="auth-switches">
+              <button type="button" class="auth-switch active" data-mode="register">Cadastrar</button>
+              <button type="button" class="auth-switch" data-mode="login">Entrar</button>
+            </div>
+          </div>
+
+          <form id="registerForm" class="auth-form" onsubmit="event.preventDefault(); return false;">
+            <label>
+              Nome completo
+              <input id="registerNameInput" type="text" required placeholder="Seu nome completo" />
+            </label>
+            <label>
+              Telefone
+              <input id="registerPhoneInput" type="tel" required placeholder="(00) 00000-0000" />
+            </label>
+            <label>
+              Senha
+              <div class="field-with-toggle">
+                <input id="registerPasswordInput" type="password" required placeholder="Senha" />
+                <button type="button" class="toggle-password-btn" data-target="registerPasswordInput">Mostrar</button>
+              </div>
+            </label>
+            <label>
+              Confirmar senha
+              <div class="field-with-toggle">
+                <input id="registerConfirmPasswordInput" type="password" required placeholder="Repita a senha" />
+                <button type="button" class="toggle-password-btn" data-target="registerConfirmPasswordInput">Mostrar</button>
+              </div>
+            </label>
+            <div class="form-actions">
+              <button id="registerSubmitButton" type="button" class="btn-primary">Cadastrar</button>
+            </div>
+          </form>
+
+          <form id="loginForm" class="auth-form hidden" onsubmit="event.preventDefault(); return false;">
+            <label>
+              Telefone
+              <input id="loginPhoneInput" type="tel" required placeholder="(00) 00000-0000" />
+            </label>
+            <label>
+              Senha
+              <div class="field-with-toggle">
+                <input id="loginPasswordInput" type="password" required placeholder="Sua senha" />
+                <button type="button" class="toggle-password-btn" data-target="loginPasswordInput">Mostrar</button>
+              </div>
+            </label>
+            <div class="form-actions">
+              <button id="loginSubmitButton" type="button" class="btn-primary">Entrar</button>
+            </div>
+          </form>
+
+          <p id="authMessage" class="auth-message"></p>
+        </section>
+      </main>
+
+      <div id="dashboardView" class="app-shell hidden">
+        <aside class="sidebar">
+          <div class="brand">
+            <div class="brand-logo">AE</div>
+            <div>
+              <p class="brand-title">Agenda Eletrônica</p>
+              <p class="brand-subtitle">CRM empresarial</p>
+            </div>
+          </div>
+          <nav class="menu">
+            <a href="#" class="menu-item active">Clientes</a>
+            <a href="#form-section" class="menu-item">Cadastrar</a>
+          </nav>
+        </aside>
+
+        <main class="main-content">
+          <header class="topbar">
+            <div>
+              <h1>Clientes Cadastrados</h1>
+              <p>Gerencie contatos, negócios e observações em um CRM leve.</p>
+            </div>
+            <div class="user-actions">
+              <p>Olá, <strong id="currentUserName">usuário</strong></p>
+              <button id="logoutButton" class="btn-secondary">Sair</button>
+            </div>
+          </header>
+
+          <section class="panel search-panel">
+            <div class="panel-header">
+              <h2>Pesquisar clientes</h2>
+            </div>
+            <div class="filter-grid">
+              <label>
+                Buscar por
+                <select id="searchType">
+                  <option value="nome">Nome</option>
+                  <option value="cpf">CPF</option>
+                  <option value="telefone">Telefone</option>
+                  <option value="observacoes">Observações</option>
+                </select>
+              </label>
+              <label>
+                Termo de busca
+                <input id="searchInput" type="text" placeholder="Buscar por nome, CPF, telefone ou observação" />
+              </label>
+              <label>
+                Data inicial
+                <input id="searchStartDate" type="date" />
+              </label>
+              <label>
+                Data final
+                <input id="searchEndDate" type="date" />
+              </label>
+              <button id="clearFilters" class="btn-secondary">Limpar filtros</button>
+              <p id="filterMessage" class="filter-message"></p>
+              <p id="filterStatus" class="filter-result"></p>
+            </div>
+          </section>
+
+          <section class="panel table-panel">
+            <div class="panel-header">
+              <h2>Lista de clientes</h2>
+              <p id="totalCount">0 clientes encontrados</p>
+            </div>
+            <div class="table-container">
+              <table class="client-table">
+                <thead>
+                  <tr>
+                    <th>Nome</th>
+                    <th>CPF</th>
+                    <th>Telefone</th>
+                    <th>Data do negócio</th>
+                    <th>Observações</th>
+                    <th>Ações</th>
+                  </tr>
+                </thead>
+                <tbody id="clientTableBody"></tbody>
+              </table>
+              <p id="emptyState" class="empty-state">Nenhum cliente encontrado.</p>
+            </div>
+          </section>
+
+          <section id="form-section" class="panel form-panel">
+            <div class="panel-header">
+              <h2 id="formHeading">Novo cliente</h2>
+              <p>Adicione seus contatos e acompanhe o fechamento de negócios.</p>
+            </div>
+            <form id="clientForm" class="client-form">
+              <div class="form-grid">
+                <label>
+                  Nome completo
+                  <input id="nameInput" type="text" required placeholder="Nome do cliente" pattern="[A-Za-zÀ-ÿ ]{3,60}" title="Digite apenas letras e espaços" />
+                </label>
+                <label>
+                  CPF
+                  <input id="cpfInput" type="text" required placeholder="000.000.000-00" maxlength="14" pattern="\d{3}\.\d{3}\.\d{3}-\d{2}" title="Digite um CPF válido no formato 000.000.000-00" inputmode="numeric" />
+                </label>
+                <label>
+                  Telefone
+                  <input id="phoneInput" type="tel" required placeholder="(00) 0 0000-0000" maxlength="15" pattern="\(\d{2}\) (?:\d \d{4}-\d{4}|\d{4}-\d{4})" title="Use o formato (00) 0 0000-0000 ou (00) 0000-0000" inputmode="numeric" />
+                </label>
+                <label>
+                  Data do negócio
+                  <input id="dateInput" type="date" required />
+                </label>
+              </div>
+              <label class="full-width">
+                Observações
+                <textarea id="notesInput" rows="4" placeholder="Descrição adicional do cliente"></textarea>
+              </label>
+              <div class="form-actions">
+                <button type="reset" class="btn-secondary">Limpar</button>
+                <button type="submit" class="btn-primary">Salvar cliente</button>
+              </div>
+            </form>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <script src="script.js"></script>
+  </body>
+</html>
