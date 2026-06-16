@@ -12,6 +12,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// Estado de disponibilidade do DB (permite iniciar servidor mesmo sem conexão)
+let dbReady = true;
+
 const dbAsync = {
   async get(sql, params = []) {
     const res = await pool.query(sql, params);
@@ -106,7 +109,8 @@ async function initializePg() {
     console.log('Initialized PostgreSQL tables');
   } catch (err) {
     console.error('Error initializing database tables:', err);
-    process.exit(1);
+    console.warn('Continuando sem conexão ativa com o banco. Alguns endpoints dependerão do DB e podem falhar. Configure DATABASE_URL para habilitar completamente.');
+    dbReady = false;
   }
 }
 
