@@ -29,14 +29,42 @@ const dbAsync = {
 
 async function initializePg() {
   try {
+    // Criar tabela de usuários com campos expandidos
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       nome TEXT NOT NULL,
       telefone TEXT NOT NULL UNIQUE,
+      email TEXT UNIQUE,
       password TEXT NOT NULL,
+      role TEXT DEFAULT 'funcionario',
+      ativo BOOLEAN DEFAULT true,
+      bloqueado BOOLEAN DEFAULT false,
+      motivo_bloqueio TEXT,
+      data_bloqueio TEXT,
+      data_desbloqueio TEXT,
       criadoEm TEXT NOT NULL
     )`);
 
+    // Adicionar colunas se não existirem (para usuários antigos)
+    const columnsToAdd = [
+      { name: 'email', type: 'TEXT UNIQUE' },
+      { name: 'role', type: "TEXT DEFAULT 'funcionario'" },
+      { name: 'ativo', type: 'BOOLEAN DEFAULT true' },
+      { name: 'bloqueado', type: 'BOOLEAN DEFAULT false' },
+      { name: 'motivo_bloqueio', type: 'TEXT' },
+      { name: 'data_bloqueio', type: 'TEXT' },
+      { name: 'data_desbloqueio', type: 'TEXT' }
+    ];
+
+    for (const col of columnsToAdd) {
+      try {
+        await pool.query(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
+      } catch (err) {
+        // Coluna já existe, ignorar
+      }
+    }
+
+    // Criar tabela de clientes
     await pool.query(`CREATE TABLE IF NOT EXISTS clients (
       id TEXT PRIMARY KEY,
       userId INTEGER NOT NULL,
@@ -47,6 +75,31 @@ async function initializePg() {
       observacoes TEXT,
       criadoEm TEXT NOT NULL,
       atualizadoEm TEXT,
+      FOREIGN KEY (userId) REFERENCES users(id)
+    )`);
+
+    // Criar tabela de logs de auditoria
+    await pool.query(`CREATE TABLE IF NOT EXISTS audit_logs (
+      id SERIAL PRIMARY KEY,
+      userId INTEGER,
+      acao TEXT NOT NULL,
+      recurso TEXT,
+      descricao TEXT,
+      ip TEXT,
+      userAgent TEXT,
+      status TEXT,
+      criadoEm TEXT NOT NULL,
+      FOREIGN KEY (userId) REFERENCES users(id)
+    )`);
+
+    // Criar tabela de tokens de reset de senha
+    await pool.query(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL,
+      token TEXT UNIQUE NOT NULL,
+      expiresAt TEXT NOT NULL,
+      usado BOOLEAN DEFAULT false,
+      criadoEm TEXT NOT NULL,
       FOREIGN KEY (userId) REFERENCES users(id)
     )`);
 
@@ -88,6 +141,10 @@ app.use(
     },
   })
 );
+
+// Verificar status do usuário (bloqueado)
+app.use(checkUserStatus);
+
 app.use(express.static(path.join(__dirname)));
 
 function sanitizePhone(value) {
@@ -114,8 +171,78 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// Middleware para verificar se usuário está bloqueado
+async function checkUserStatus(req, res, next) {
+  if (!req.session.userId) {
+    return next();
+  }
+  
+  const user = await dbAsync.get('SELECT bloqueado FROM users WHERE id = $1', [req.session.userId]);
+  if (user && user.bloqueado) {
+    req.session.destroy();
+    return res.status(403).json({ error: 'Sua conta foi bloqueada.' });
+  }
+  
+  next();
+}
+
+// Middleware para verificar role (cargo)
+function requireRole(...rolesPermitidas) {
+  return async (req, res, next) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: 'Não autenticado.' });
+    }
+    
+    const user = await dbAsync.get('SELECT role, bloqueado FROM users WHERE id = $1', [req.session.userId]);
+    if (!user) {
+      return res.status(401).json({ error: 'Usuário não encontrado.' });
+    }
+    
+    if (user.bloqueado) {
+      req.session.destroy();
+      return res.status(403).json({ error: 'Sua conta foi bloqueada.' });
+    }
+    
+    if (!rolesPermitidas.flat().includes(user.role)) {
+      await createAuditLog(req.session.userId, 'acesso_negado', 'recurso_restrito', `Tentativa de acesso sem permissão ao recurso: ${req.originalUrl}`, req);
+      return res.status(403).json({ error: 'Permissão negada.' });
+    }
+    
+    req.user = user;
+    next();
+  };
+}
+
 async function getCurrentUser(req) {
-  return await dbAsync.get('SELECT id, nome, telefone FROM users WHERE id = $1', [req.session.userId]);
+  return await dbAsync.get('SELECT id, nome, telefone, email, role, bloqueado FROM users WHERE id = $1', [req.session.userId]);
+}
+
+// Validar força de senha (8+ caracteres, maiúscula, minúscula, número, caractere especial)
+function isStrongPassword(senha) {
+  if (!senha || typeof senha !== 'string') return false;
+  if (senha.length < 8) return false;
+  const regex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*]).{8,}$/;
+  return regex.test(senha);
+}
+
+// Gerar token de reset de senha
+function generateResetToken() {
+  const crypto = require('crypto');
+  return crypto.randomBytes(32).toString('hex');
+}
+
+// Criar log de auditoria
+async function createAuditLog(userId, acao, recurso, descricao, req) {
+  try {
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'desconhecido';
+    const userAgent = req.headers['user-agent'] || '';
+    await dbAsync.run(
+      'INSERT INTO audit_logs (userId, acao, recurso, descricao, ip, userAgent, status, criadoEm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+      [userId, acao, recurso, descricao, ip, userAgent, 'success', new Date().toISOString()]
+    );
+  } catch (err) {
+    console.error('Erro ao criar log de auditoria:', err);
+  }
 }
 
 app.post('/api/auth/register', async (req, res) => {
@@ -364,10 +491,249 @@ app.delete('/api/clients/:id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Cliente não encontrado.' });
     }
     await dbAsync.run('DELETE FROM clients WHERE id = $1 AND userId = $2', [id, req.session.userId]);
+    
+    await createAuditLog(req.session.userId, 'deletar_cliente', 'cliente', `Cliente excluído: ${existing.nome}`, req);
+    
     res.json(existing);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Erro ao excluir cliente.' });
+  }
+});
+
+// ============ NOVOS ENDPOINTS DE AUTENTICAÇÃO ============
+
+// Alterar senha própria
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  try {
+    const { senhaAtual, novaSenha, confirmaSenha } = req.body;
+    
+    if (!senhaAtual || !novaSenha || !confirmaSenha) {
+      return res.status(400).json({ error: 'Preencha todos os campos.' });
+    }
+    
+    if (novaSenha !== confirmaSenha) {
+      return res.status(400).json({ error: 'As senhas não coincidem.' });
+    }
+    
+    if (!isStrongPassword(novaSenha)) {
+      return res.status(400).json({ 
+        error: 'Senha fraca. Use 8+ caracteres, maiúscula, minúscula, número e caractere especial (ex: !@#$%^&*).' 
+      });
+    }
+    
+    const user = await dbAsync.get('SELECT password FROM users WHERE id = $1', [req.session.userId]);
+    const senhaCorreta = await bcrypt.compare(senhaAtual, user.password);
+    
+    if (!senhaCorreta) {
+      await createAuditLog(req.session.userId, 'alteracao_senha_falha', 'usuario', 'Tentativa de alteração com senha incorreta', req);
+      return res.status(401).json({ error: 'Senha atual incorreta.' });
+    }
+    
+    const novoHash = await bcrypt.hash(novaSenha, 10);
+    await dbAsync.run('UPDATE users SET password = $1 WHERE id = $2', [novoHash, req.session.userId]);
+    
+    await createAuditLog(req.session.userId, 'alteracao_senha', 'usuario', 'Senha alterada com sucesso', req);
+    res.json({ ok: true, mensagem: 'Senha alterada com sucesso.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao alterar senha.' });
+  }
+});
+
+// Solicitar recuperação de senha
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email é obrigatório.' });
+    }
+    
+    const user = await dbAsync.get('SELECT id, nome FROM users WHERE email = $1', [email]);
+    if (!user) {
+      // Não revelar se email existe ou não (segurança)
+      return res.status(200).json({ ok: true, mensagem: 'Se o email existe na base, um link de recuperação foi enviado.' });
+    }
+    
+    const token = generateResetToken();
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60).toISOString(); // 1 hora
+    
+    await dbAsync.run(
+      'INSERT INTO password_reset_tokens (userId, token, expiresAt, criadoEm) VALUES ($1, $2, $3, $4)',
+      [user.id, token, expiresAt, new Date().toISOString()]
+    );
+    
+    // TODO: Enviar email com link de reset usando Nodemailer
+    console.log(`Token de reset para ${email}: ${token}`);
+    
+    await createAuditLog(user.id, 'solicitar_reset_senha', 'usuario', 'Email de reset solicitado', req);
+    
+    res.json({ ok: true, mensagem: 'Se o email existe na base, um link de recuperação foi enviado.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao processar recuperação.' });
+  }
+});
+
+// Validar token e resetar senha
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, novaSenha, confirmaSenha } = req.body;
+    
+    if (!token || !novaSenha || !confirmaSenha) {
+      return res.status(400).json({ error: 'Preencha todos os campos.' });
+    }
+    
+    if (novaSenha !== confirmaSenha) {
+      return res.status(400).json({ error: 'As senhas não coincidem.' });
+    }
+    
+    if (!isStrongPassword(novaSenha)) {
+      return res.status(400).json({ 
+        error: 'Senha fraca. Use 8+ caracteres, maiúscula, minúscula, número e caractere especial.' 
+      });
+    }
+    
+    const resetToken = await dbAsync.get(
+      'SELECT userId FROM password_reset_tokens WHERE token = $1 AND usado = false AND expiresAt > $2',
+      [token, new Date().toISOString()]
+    );
+    
+    if (!resetToken) {
+      return res.status(400).json({ error: 'Token inválido ou expirado.' });
+    }
+    
+    const novoHash = await bcrypt.hash(novaSenha, 10);
+    await dbAsync.run('UPDATE users SET password = $1 WHERE id = $2', [novoHash, resetToken.userId]);
+    await dbAsync.run('UPDATE password_reset_tokens SET usado = true WHERE token = $1', [token]);
+    
+    await createAuditLog(resetToken.userId, 'reset_senha', 'usuario', 'Senha resetada via token', req);
+    
+    res.json({ ok: true, mensagem: 'Senha alterada com sucesso.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao resetar senha.' });
+  }
+});
+
+// ============ ENDPOINTS ADMINISTRATIVOS ============
+
+// Bloquear usuário (Super Admin)
+app.post('/api/admin/users/:userId/block', requireRole('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { motivo } = req.body;
+    
+    const userToBlock = await dbAsync.get('SELECT role, nome FROM users WHERE id = $1', [userId]);
+    
+    if (!userToBlock) {
+      return res.status(404).json({ error: 'Usuário não encontrado.' });
+    }
+    
+    if (userToBlock.role === 'super_admin') {
+      await createAuditLog(req.session.userId, 'bloquear_usuario_falha', 'usuario', `Tentativa de bloquear super_admin`, req);
+      return res.status(403).json({ error: 'Não pode bloquear super_admin.' });
+    }
+    
+    await dbAsync.run(
+      'UPDATE users SET bloqueado = true, motivo_bloqueio = $1, data_bloqueio = $2 WHERE id = $3',
+      [motivo || 'Bloqueado pelo administrador', new Date().toISOString(), userId]
+    );
+    
+    await createAuditLog(req.session.userId, 'bloquear_usuario', 'usuario', `Usuário ${userToBlock.nome} bloqueado. Motivo: ${motivo}`, req);
+    
+    res.json({ ok: true, mensagem: 'Usuário bloqueado com sucesso.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao bloquear usuário.' });
+  }
+});
+
+// Desbloquear usuário (Super Admin)
+app.post('/api/admin/users/:userId/unblock', requireRole('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await dbAsync.get('SELECT nome FROM users WHERE id = $1', [userId]);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado.' });
+    }
+    
+    await dbAsync.run(
+      'UPDATE users SET bloqueado = false, motivo_bloqueio = NULL, data_desbloqueio = $1 WHERE id = $2',
+      [new Date().toISOString(), userId]
+    );
+    
+    await createAuditLog(req.session.userId, 'desbloquear_usuario', 'usuario', `Usuário ${user.nome} desbloqueado`, req);
+    
+    res.json({ ok: true, mensagem: 'Usuário desbloqueado com sucesso.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao desbloquear usuário.' });
+  }
+});
+
+// Alterar role de usuário (Super Admin)
+app.put('/api/admin/users/:userId/role', requireRole('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { novoRole } = req.body;
+    
+    const rolesValidos = ['super_admin', 'admin', 'gerente', 'funcionario'];
+    if (!rolesValidos.includes(novoRole)) {
+      return res.status(400).json({ error: 'Role inválido.' });
+    }
+    
+    const userAtual = await dbAsync.get('SELECT role, nome FROM users WHERE id = $1', [userId]);
+    if (!userAtual) {
+      return res.status(404).json({ error: 'Usuário não encontrado.' });
+    }
+    
+    if (userAtual.role === 'super_admin' && novoRole !== 'super_admin') {
+      await createAuditLog(req.session.userId, 'alterar_role_falha', 'usuario', `Tentativa de alterar role de super_admin`, req);
+      return res.status(403).json({ error: 'Não pode alterar role de super_admin.' });
+    }
+    
+    await dbAsync.run('UPDATE users SET role = $1 WHERE id = $2', [novoRole, userId]);
+    
+    await createAuditLog(req.session.userId, 'alterar_role', 'usuario', `Role de ${userAtual.nome} alterado para ${novoRole}`, req);
+    
+    res.json({ ok: true, mensagem: 'Role alterado com sucesso.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao alterar role.' });
+  }
+});
+
+// Listar usuários (Super Admin e Admin)
+app.get('/api/admin/users', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const users = await dbAsync.all(
+      'SELECT id, nome, email, telefone, role, ativo, bloqueado, motivo_bloqueio, data_bloqueio, criadoEm FROM users ORDER BY criadoEm DESC'
+    );
+    res.json(users);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao listar usuários.' });
+  }
+});
+
+// Obter logs de auditoria (Super Admin e Admin)
+app.get('/api/admin/audit-logs', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 100;
+    const offset = (page - 1) * limit;
+    
+    const logs = await dbAsync.all(
+      'SELECT * FROM audit_logs ORDER BY criadoEm DESC LIMIT $1 OFFSET $2',
+      [limit, offset]
+    );
+    res.json(logs);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao buscar logs.' });
   }
 });
 
