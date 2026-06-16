@@ -245,6 +245,58 @@ async function createAuditLog(userId, acao, recurso, descricao, req) {
   }
 }
 
+// Enviar e-mail genérico (usa variáveis de ambiente SMTP). Se não configurado, loga o link.
+async function sendEmail(to, subject, html, req) {
+  try {
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpPort = process.env.SMTP_PORT;
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
+    const fromAddress = process.env.EMAIL_FROM || `no-reply@${req.headers.host || 'localhost'}`;
+
+    if (smtpHost && smtpUser && smtpPass) {
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: parseInt(smtpPort || '587'),
+        secure: smtpPort === '465',
+        auth: {
+          user: smtpUser,
+          pass: smtpPass,
+        },
+      });
+
+      await transporter.sendMail({
+        from: fromAddress,
+        to,
+        subject,
+        html,
+      });
+      return true;
+    }
+
+    // Fallback: logar o conteúdo do e-mail para ambientes sem SMTP
+    console.log('[EMAIL DEBUG] to:', to, 'subject:', subject);
+    console.log(html);
+    return false;
+  } catch (err) {
+    console.error('Erro ao enviar e-mail:', err);
+    return false;
+  }
+}
+
+async function sendResetEmail(toEmail, toName, token, req) {
+  const resetUrl = `${req.protocol}://${req.get('host')}/?reset_token=${token}`;
+  const html = `
+    <p>Olá ${toName || ''},</p>
+    <p>Recebemos uma solicitação para redefinir sua senha. Clique no link abaixo para criar uma nova senha. O link expira em 1 hora.</p>
+    <p><a href="${resetUrl}">${resetUrl}</a></p>
+    <p>Se você não solicitou esta alteração, ignore este e-mail.</p>
+  `;
+
+  return await sendEmail(toEmail, 'Redefinição de senha - Agenda Eletrônica', html, req);
+}
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { nome, telefone, senha, confirmSenha } = req.body;
@@ -564,11 +616,15 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       [user.id, token, expiresAt, new Date().toISOString()]
     );
     
-    // TODO: Enviar email com link de reset usando Nodemailer
-    console.log(`Token de reset para ${email}: ${token}`);
-    
+    // Enviar email de reset (ou log se SMTP não configurado)
+    try {
+      await sendResetEmail(email, user.nome, token, req);
+    } catch (err) {
+      console.error('Erro ao disparar email de reset:', err);
+    }
+
     await createAuditLog(user.id, 'solicitar_reset_senha', 'usuario', 'Email de reset solicitado', req);
-    
+
     res.json({ ok: true, mensagem: 'Se o email existe na base, um link de recuperação foi enviado.' });
   } catch (error) {
     console.error(error);
@@ -609,7 +665,21 @@ app.post('/api/auth/reset-password', async (req, res) => {
     await dbAsync.run('UPDATE password_reset_tokens SET usado = true WHERE token = $1', [token]);
     
     await createAuditLog(resetToken.userId, 'reset_senha', 'usuario', 'Senha resetada via token', req);
-    
+
+    // Enviar confirmação de alteração por e-mail se possível
+    try {
+      const usuario = await dbAsync.get('SELECT email, nome FROM users WHERE id = $1', [resetToken.userId]);
+      if (usuario && usuario.email) {
+        const html = `
+          <p>Olá ${usuario.nome || ''},</p>
+          <p>Sua senha foi alterada com sucesso. Se você não realizou essa alteração, entre em contato com o administrador imediatamente.</p>
+        `;
+        await sendEmail(usuario.email, 'Confirmação de alteração de senha - Agenda Eletrônica', html, req);
+      }
+    } catch (err) {
+      console.error('Erro ao enviar confirmação por email:', err);
+    }
+
     res.json({ ok: true, mensagem: 'Senha alterada com sucesso.' });
   } catch (error) {
     console.error(error);
@@ -734,6 +804,45 @@ app.get('/api/admin/audit-logs', requireRole('super_admin', 'admin'), async (req
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Erro ao buscar logs.' });
+  }
+});
+
+// Preview do email de reset (Admin)
+app.get('/api/admin/preview-reset-email', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const email = String(req.query.email || 'user@example.com');
+    const name = String(req.query.name || 'Usuário');
+    const token = generateResetToken();
+    const resetUrl = `${req.protocol}://${req.get('host')}/?reset_token=${token}`;
+    const html = `
+      <div style="font-family: Arial, sans-serif; color: #111;">
+        <h2>Redefinição de senha</h2>
+        <p>Olá ${name},</p>
+        <p>Recebemos uma solicitação para redefinir sua senha. Clique no link abaixo para criar uma nova senha. O link expira em 1 hora.</p>
+        <p><a href="${resetUrl}">${resetUrl}</a></p>
+        <p>Se você não solicitou esta alteração, ignore este e-mail.</p>
+      </div>
+    `;
+    res.set('Content-Type', 'text/html');
+    res.send(html);
+  } catch (err) {
+    console.error('Erro preview email:', err);
+    res.status(500).json({ error: 'Erro ao gerar preview do email.' });
+  }
+});
+
+// Enviar email de teste (Admin)
+app.post('/api/admin/send-test-email', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const { email, name } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email é obrigatório.' });
+    const token = generateResetToken();
+    const sent = await sendResetEmail(email, name || 'Usuário', token, req);
+    await createAuditLog(req.session.userId, 'enviar_teste_email', 'usuario', `Envio de email de teste para ${email}`, req);
+    res.json({ ok: true, sent });
+  } catch (err) {
+    console.error('Erro ao enviar email de teste:', err);
+    res.status(500).json({ error: 'Erro ao enviar email de teste.' });
   }
 });
 
