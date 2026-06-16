@@ -92,8 +92,22 @@
               <p>Gerencie contatos, negócios e observações em um CRM leve.</p>
             </div>
             <div class="user-actions">
-              <p>Olá, <strong id="currentUserName">usuário</strong></p>
-              <button id="logoutButton" class="btn-secondary">Sair</button>
+              <div class="user-menu">
+                <button id="userMenuButton" class="user-menu-toggle">
+                  <span id="currentUserName">usuário</span>
+                  <span class="user-role" id="currentUserRole"></span>
+                </button>
+                <div id="userMenuDropdown" class="user-menu-dropdown hidden">
+                  <a href="#profile-section" class="menu-option">📋 Meu Perfil</a>
+                  <a href="#change-password-section" class="menu-option">🔐 Alterar Senha</a>
+                  <div id="adminMenuOption" class="hidden">
+                    <hr />
+                    <a href="#admin-section" class="menu-option">⚙️ Painel Admin</a>
+                  </div>
+                  <hr />
+                  <button id="logoutButton" class="menu-option btn-text">🚪 Sair</button>
+                </div>
+              </div>
             </div>
           </header>
 
@@ -185,6 +199,135 @@
                 <button type="submit" class="btn-primary">Salvar cliente</button>
               </div>
             </form>
+          </section>
+
+          <!-- SEÇÃO: PERFIL DO USUÁRIO -->
+          <section id="profile-section" class="panel profile-panel hidden">
+            <div class="panel-header">
+              <h2>Meu Perfil</h2>
+            </div>
+            <div class="profile-info">
+              <div class="info-group">
+                <label>Nome:</label>
+                <p id="profileName">—</p>
+              </div>
+              <div class="info-group">
+                <label>Email:</label>
+                <p id="profileEmail">—</p>
+              </div>
+              <div class="info-group">
+                <label>Telefone:</label>
+                <p id="profilePhone">—</p>
+              </div>
+              <div class="info-group">
+                <label>Cargo:</label>
+                <p id="profileRole">—</p>
+              </div>
+              <div class="form-actions">
+                <a href="#" class="btn-secondary">Voltar</a>
+              </div>
+            </div>
+          </section>
+
+          <!-- SEÇÃO: ALTERAR SENHA -->
+          <section id="change-password-section" class="panel form-panel hidden">
+            <div class="panel-header">
+              <h2>Alterar Senha</h2>
+              <p>Mantenha sua conta segura com uma senha forte.</p>
+            </div>
+            <form id="changePasswordForm" class="client-form">
+              <label>
+                Senha Atual
+                <div class="field-with-toggle">
+                  <input id="currentPasswordInput" type="password" required placeholder="Sua senha atual" />
+                  <button type="button" class="toggle-password-btn" data-target="currentPasswordInput">Mostrar</button>
+                </div>
+              </label>
+              <label>
+                Nova Senha
+                <div class="field-with-toggle">
+                  <input id="newPasswordInput" type="password" required placeholder="Nova senha (8+ caracteres, maiúscula, minúscula, número, caractere especial)" />
+                  <button type="button" class="toggle-password-btn" data-target="newPasswordInput">Mostrar</button>
+                </div>
+              </label>
+              <label>
+                Confirmar Nova Senha
+                <div class="field-with-toggle">
+                  <input id="confirmNewPasswordInput" type="password" required placeholder="Repita a nova senha" />
+                  <button type="button" class="toggle-password-btn" data-target="confirmNewPasswordInput">Mostrar</button>
+                </div>
+              </label>
+              <p id="passwordStrengthMessage" class="password-strength"></p>
+              <div class="form-actions">
+                <a href="#" class="btn-secondary">Cancelar</a>
+                <button type="submit" class="btn-primary">Alterar Senha</button>
+              </div>
+            </form>
+            <p id="changePasswordMessage" class="auth-message"></p>
+          </section>
+
+          <!-- SEÇÃO: PAINEL ADMIN -->
+          <section id="admin-section" class="panel admin-panel hidden">
+            <div class="panel-header">
+              <h2>Painel Administrativo</h2>
+              <p>Gerencie usuários, cargos e auditoria do sistema.</p>
+            </div>
+
+            <!-- ABAS DO ADMIN -->
+            <div class="admin-tabs">
+              <button class="admin-tab active" data-tab="users">👥 Usuários</button>
+              <button class="admin-tab" data-tab="audit">📋 Logs de Auditoria</button>
+            </div>
+
+            <!-- ABA: USUÁRIOS -->
+            <div id="admin-users-tab" class="admin-tab-content active">
+              <div class="search-bar">
+                <input id="adminSearchUsers" type="text" placeholder="Buscar usuário por nome ou email..." />
+              </div>
+              <div class="table-container">
+                <table class="admin-table">
+                  <thead>
+                    <tr>
+                      <th>Nome</th>
+                      <th>Email</th>
+                      <th>Telefone</th>
+                      <th>Cargo</th>
+                      <th>Status</th>
+                      <th>Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody id="adminUsersTableBody"></tbody>
+                </table>
+                <p id="adminUsersEmpty" class="empty-state hidden">Nenhum usuário encontrado.</p>
+              </div>
+            </div>
+
+            <!-- ABA: LOGS DE AUDITORIA -->
+            <div id="admin-audit-tab" class="admin-tab-content hidden">
+              <div class="search-bar">
+                <input id="adminSearchAudit" type="text" placeholder="Buscar por ação ou usuário..." />
+              </div>
+              <div class="table-container">
+                <table class="admin-table">
+                  <thead>
+                    <tr>
+                      <th>Data</th>
+                      <th>Usuário</th>
+                      <th>Ação</th>
+                      <th>Recurso</th>
+                      <th>Descrição</th>
+                      <th>IP</th>
+                    </tr>
+                  </thead>
+                  <tbody id="adminAuditTableBody"></tbody>
+                </table>
+                <p id="adminAuditEmpty" class="empty-state hidden">Nenhum log encontrado.</p>
+              </div>
+            </div>
+
+            <div class="form-actions">
+              <a href="#" class="btn-secondary">Voltar</a>
+            </div>
           </section>
         </main>
       </div>

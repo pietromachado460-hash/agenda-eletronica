@@ -28,10 +28,38 @@ const authMessage = document.getElementById('authMessage');
 const authView = document.getElementById('authView');
 const dashboardView = document.getElementById('dashboardView');
 const currentUserName = document.getElementById('currentUserName');
+const currentUserRole = document.getElementById('currentUserRole');
 const logoutButton = document.getElementById('logoutButton');
 const authSwitchButtons = Array.from(document.querySelectorAll('.auth-switch'));
+
+// Elementos do menu de usuário
+const userMenuButton = document.getElementById('userMenuButton');
+const userMenuDropdown = document.getElementById('userMenuDropdown');
+const adminMenuOption = document.getElementById('adminMenuOption');
+
+// Elementos de Perfil
+const profileSection = document.getElementById('profile-section');
+const profileName = document.getElementById('profileName');
+const profileEmail = document.getElementById('profileEmail');
+const profilePhone = document.getElementById('profilePhone');
+const profileRole = document.getElementById('profileRole');
+
+// Elementos de Alterar Senha
+const changePasswordSection = document.getElementById('change-password-section');
+const changePasswordForm = document.getElementById('changePasswordForm');
+const changePasswordMessage = document.getElementById('changePasswordMessage');
+
+// Elementos de Admin
+const adminSection = document.getElementById('admin-section');
+const adminTabs = Array.from(document.querySelectorAll('.admin-tab'));
+const adminUsersTab = document.getElementById('admin-users-tab');
+const adminAuditTab = document.getElementById('admin-audit-tab');
+const adminUsersTableBody = document.getElementById('adminUsersTableBody');
+const adminAuditTableBody = document.getElementById('adminAuditTableBody');
+
 let editingClientId = null;
 let lastClients = [];
+let currentUser = null;
 
 function formatName(value) {
   return value.replace(/[^A-Za-zÀ-ÿ ]/g, '').replace(/\s{2,}/g, ' ');
@@ -155,7 +183,15 @@ async function safeFetch(path, options = {}) {
 async function loadSession() {
   try {
     const user = await safeFetch('/auth/me', { method: 'GET' });
+    currentUser = user;
     currentUserName.textContent = user.nome;
+    currentUserRole.textContent = user.role.toUpperCase();
+    
+    // Mostrar menu admin se for super_admin ou admin
+    if (user.role === 'super_admin' || user.role === 'admin') {
+      adminMenuOption.classList.remove('hidden');
+    }
+    
     showView('dashboard');
     fetchClients();
   } catch (error) {
@@ -238,9 +274,212 @@ async function handleRegister(event) {
 async function logout() {
   try {
     await safeFetch('/auth/logout', { method: 'POST' });
+    currentUser = null;
     showView('auth');
   } catch (error) {
     showAlert(error.message);
+  }
+}
+
+// ======= NOVO: FUNÇÕES DE MENU DE USUÁRIO =======
+function toggleUserMenu() {
+  userMenuDropdown.classList.toggle('hidden');
+}
+
+function closeUserMenu() {
+  userMenuDropdown.classList.add('hidden');
+}
+
+// ======= NOVO: FUNÇÕES DE PERFIL =======
+function showProfileSection() {
+  profileName.textContent = currentUser.nome;
+  profileEmail.textContent = currentUser.email || '—';
+  profilePhone.textContent = currentUser.telefone;
+  profileRole.textContent = currentUser.role.toUpperCase();
+  
+  profileSection.classList.remove('hidden');
+  clientForm.parentElement.classList.add('hidden');
+  closeUserMenu();
+}
+
+// ======= NOVO: FUNÇÕES DE ALTERAÇÃO DE SENHA =======
+function showChangePasswordSection() {
+  changePasswordSection.classList.remove('hidden');
+  clientForm.parentElement.classList.add('hidden');
+  changePasswordMessage.textContent = '';
+  closeUserMenu();
+}
+
+async function handleChangePassword(event) {
+  event.preventDefault();
+  changePasswordMessage.textContent = '';
+
+  const senhaAtual = document.getElementById('currentPasswordInput').value;
+  const novaSenha = document.getElementById('newPasswordInput').value;
+  const confirmaSenha = document.getElementById('confirmNewPasswordInput').value;
+
+  if (!senhaAtual || !novaSenha || !confirmaSenha) {
+    changePasswordMessage.textContent = 'Preencha todos os campos.';
+    return;
+  }
+
+  if (novaSenha !== confirmaSenha) {
+    changePasswordMessage.textContent = 'As senhas não coincidem.';
+    return;
+  }
+
+  if (novaSenha.length < 8) {
+    changePasswordMessage.textContent = 'Senha deve ter pelo menos 8 caracteres.';
+    return;
+  }
+
+  try {
+    const result = await safeFetch('/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ senhaAtual, novaSenha, confirmaSenha }),
+    });
+    
+    changePasswordMessage.textContent = result.mensagem;
+    changePasswordForm.reset();
+    
+    setTimeout(() => {
+      showProfileSection();
+    }, 2000);
+  } catch (error) {
+    changePasswordMessage.textContent = error.message;
+  }
+}
+
+// ======= NOVO: FUNÇÕES DE ADMIN =======
+function showAdminSection() {
+  adminSection.classList.remove('hidden');
+  clientForm.parentElement.classList.add('hidden');
+  closeUserMenu();
+  loadAdminUsers();
+}
+
+async function loadAdminUsers() {
+  try {
+    const users = await safeFetch('/admin/users', { method: 'GET' });
+    adminUsersTableBody.innerHTML = '';
+
+    if (users.length === 0) {
+      document.getElementById('adminUsersEmpty').classList.remove('hidden');
+      return;
+    }
+
+    document.getElementById('adminUsersEmpty').classList.add('hidden');
+
+    users.forEach((user) => {
+      const roleColors = {
+        'super_admin': '#4f46e5',
+        'admin': '#3b82f6',
+        'gerente': '#8b5cf6',
+        'funcionario': '#6b7280',
+      };
+
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td>${user.nome}</td>
+        <td>${user.email || '—'}</td>
+        <td>${user.telefone}</td>
+        <td><span style="color: ${roleColors[user.role] || '#94a3b8'}">${user.role.toUpperCase()}</span></td>
+        <td>
+          <span class="status-badge ${user.bloqueado ? 'status-blocked' : 'status-active'}">
+            ${user.bloqueado ? '🔒 Bloqueado' : '✓ Ativo'}
+          </span>
+        </td>
+        <td>
+          <div class="action-buttons">
+            ${user.role !== 'super_admin' ? `
+              <button class="btn-icon btn-block-user" data-userid="${user.id}" data-blocked="${user.bloqueado}">
+                ${user.bloqueado ? '🔓 Desbloquear' : '🔒 Bloquear'}
+              </button>
+            ` : ''}
+            ${currentUser.role === 'super_admin' && user.role !== 'super_admin' ? `
+              <button class="btn-icon btn-change-role" data-userid="${user.id}">⚡ Cargo</button>
+            ` : ''}
+          </div>
+        </td>
+      `;
+
+      adminUsersTableBody.appendChild(row);
+    });
+  } catch (error) {
+    showAlert('Erro ao carregar usuários: ' + error.message);
+  }
+}
+
+async function loadAdminAuditLogs() {
+  try {
+    const logs = await safeFetch('/admin/audit-logs?limit=500', { method: 'GET' });
+    adminAuditTableBody.innerHTML = '';
+
+    if (logs.length === 0) {
+      document.getElementById('adminAuditEmpty').classList.remove('hidden');
+      return;
+    }
+
+    document.getElementById('adminAuditEmpty').classList.add('hidden');
+
+    logs.forEach((log) => {
+      const row = document.createElement('tr');
+      const data = new Date(log.criadoEm).toLocaleString('pt-BR');
+      
+      row.innerHTML = `
+        <td>${data}</td>
+        <td>${log.userId || '—'}</td>
+        <td>${log.acao}</td>
+        <td>${log.recurso || '—'}</td>
+        <td>${log.descricao || '—'}</td>
+        <td><small>${log.ip}</small></td>
+      `;
+
+      adminAuditTableBody.appendChild(row);
+    });
+  } catch (error) {
+    showAlert('Erro ao carregar logs: ' + error.message);
+  }
+}
+
+// ======= NOVO: AÇÕES ADMIN =======
+async function handleBlockUser(userId, isBlocked) {
+  const motivo = prompt(isBlocked ? 'Desbloquear usuário?' : 'Motivo do bloqueio:');
+  
+  if (motivo === null) return;
+
+  try {
+    if (isBlocked) {
+      await safeFetch(`/admin/users/${userId}/unblock`, { method: 'POST' });
+    } else {
+      await safeFetch(`/admin/users/${userId}/block`, {
+        method: 'POST',
+        body: JSON.stringify({ motivo }),
+      });
+    }
+    
+    loadAdminUsers();
+    showAlert(isBlocked ? 'Usuário desbloqueado.' : 'Usuário bloqueado.');
+  } catch (error) {
+    showAlert('Erro: ' + error.message);
+  }
+}
+
+async function handleChangeRole(userId) {
+  const newRole = prompt('Novo cargo (super_admin, admin, gerente, funcionario):');
+  
+  if (newRole === null) return;
+
+  try {
+    await safeFetch(`/admin/users/${userId}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ novoRole: newRole }),
+    });
+    
+    loadAdminUsers();
+    showAlert('Cargo alterado com sucesso.');
+  } catch (error) {
+    showAlert('Erro: ' + error.message);
   }
 }
 
@@ -504,6 +743,81 @@ authSwitchButtons.forEach((button) => {
 const passwordToggleButtons = Array.from(document.querySelectorAll('.toggle-password-btn'));
 passwordToggleButtons.forEach((button) => {
   button.addEventListener('click', togglePasswordVisibility);
+});
+
+// ======= NOVO: EVENT LISTENERS DO MENU DE USUÁRIO =======
+userMenuButton.addEventListener('click', toggleUserMenu);
+
+// Fechar menu ao clicar em links
+document.querySelectorAll('.user-menu-dropdown a').forEach((link) => {
+  link.addEventListener('click', (e) => {
+    const href = link.getAttribute('href');
+    if (href === '#profile-section') {
+      e.preventDefault();
+      showProfileSection();
+    } else if (href === '#change-password-section') {
+      e.preventDefault();
+      showChangePasswordSection();
+    } else if (href === '#admin-section') {
+      e.preventDefault();
+      showAdminSection();
+    }
+  });
+});
+
+// Fechar menu ao clicar em logout
+// logoutButton já tem o event listener
+
+// ======= NOVO: EVENT LISTENERS DO PERFIL =======
+document.querySelectorAll('a[href="#"]').forEach((link) => {
+  link.addEventListener('click', (e) => {
+    e.preventDefault();
+    profileSection.classList.add('hidden');
+    changePasswordSection.classList.add('hidden');
+    adminSection.classList.add('hidden');
+    clientForm.parentElement.classList.remove('hidden');
+  });
+});
+
+// ======= NOVO: EVENT LISTENER DO FORMULÁRIO DE ALTERAR SENHA =======
+changePasswordForm.addEventListener('submit', handleChangePassword);
+
+// ======= NOVO: EVENT LISTENERS DAS ABAS DO ADMIN =======
+adminTabs.forEach((tab) => {
+  tab.addEventListener('click', () => {
+    adminTabs.forEach((t) => t.classList.remove('active'));
+    document.querySelectorAll('.admin-tab-content').forEach((content) => {
+      content.classList.remove('active');
+    });
+
+    tab.classList.add('active');
+    const tabName = tab.dataset.tab;
+
+    if (tabName === 'users') {
+      adminUsersTab.classList.add('active');
+      loadAdminUsers();
+    } else if (tabName === 'audit') {
+      adminAuditTab.classList.add('active');
+      loadAdminAuditLogs();
+    }
+  });
+});
+
+// ======= NOVO: EVENT LISTENERS DE AÇÕES ADMIN =======
+adminUsersTableBody.addEventListener('click', async (event) => {
+  const blockBtn = event.target.closest('.btn-block-user');
+  const roleBtn = event.target.closest('.btn-change-role');
+
+  if (blockBtn) {
+    const userId = blockBtn.dataset.userid;
+    const isBlocked = blockBtn.dataset.blocked === 'true';
+    await handleBlockUser(parseInt(userId), isBlocked);
+  }
+
+  if (roleBtn) {
+    const userId = roleBtn.dataset.userid;
+    await handleChangeRole(parseInt(userId));
+  }
 });
 
 function updateSearchPlaceholder() {

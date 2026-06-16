@@ -342,7 +342,7 @@ app.get('/api/auth/me', async (req, res) => {
     return res.status(401).json({ error: 'Não autenticado.' });
   }
 
-  const user = await getCurrentUser(req);
+  const user = await dbAsync.get('SELECT id, nome, telefone, email, role, bloqueado FROM users WHERE id = $1', [req.session.userId]);
   if (!user) {
     return res.status(401).json({ error: 'Sessão inválida.' });
   }
