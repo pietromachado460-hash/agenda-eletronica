@@ -158,10 +158,13 @@ app.post('/api/auth/register', async (req, res) => {
     const newId = result.rows && result.rows[0] ? result.rows[0].id : null;
     req.session.userId = newId;
     res.status(201).json({ id: newId, nome: nome.trim(), telefone: normalizedPhone });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Erro interno ao cadastrar usuário.' });
-  }
+ } catch (error) {
+  console.error('REGISTER ERROR:', error);
+  res.status(500).json({
+    error: 'Erro interno ao cadastrar usuário.',
+    details: error.message
+  });
+}
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -306,10 +309,13 @@ app.post('/api/clients', requireAuth, async (req, res) => {
 
     const newClient = await dbAsync.get('SELECT * FROM clients WHERE id = $1 AND userId = $2', [clientId, req.session.userId]);
     res.status(201).json(newClient);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Erro ao salvar cliente.' });
-  }
+ } catch (error) {
+  console.error('CLIENT ERROR:', error);
+  res.status(500).json({
+    error: 'Erro ao salvar cliente.',
+    details: error.message
+  });
+}
 });
 
 app.put('/api/clients/:id', requireAuth, async (req, res) => {
