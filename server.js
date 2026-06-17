@@ -1,10 +1,14 @@
+require('dotenv').config();
 const path = require('path');
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const session = require('express-session');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
 const pool = new Pool({
@@ -17,16 +21,34 @@ let dbReady = true;
 
 const dbAsync = {
   async get(sql, params = []) {
-    const res = await pool.query(sql, params);
-    return res.rows[0];
+    try {
+      const res = await pool.query(sql, params);
+      return res.rows[0];
+    } catch (err) {
+      console.error('DB query error:', err);
+      dbReady = false;
+      throw err;
+    }
   },
   async all(sql, params = []) {
-    const res = await pool.query(sql, params);
-    return res.rows;
+    try {
+      const res = await pool.query(sql, params);
+      return res.rows;
+    } catch (err) {
+      console.error('DB query error:', err);
+      dbReady = false;
+      throw err;
+    }
   },
   async run(sql, params = []) {
-    const res = await pool.query(sql, params);
-    return res;
+    try {
+      const res = await pool.query(sql, params);
+      return res;
+    } catch (err) {
+      console.error('DB query error:', err);
+      dbReady = false;
+      throw err;
+    }
   },
 };
 
@@ -116,6 +138,7 @@ async function initializePg() {
 
 initializePg();
 
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
@@ -134,17 +157,35 @@ app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
 });
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas requisições. Tente novamente mais tarde.' },
+});
+app.use('/api', apiLimiter);
+
 app.use(
   session({
-    secret: 'agenda-eletronica-secret',
+    secret: process.env.SESSION_SECRET || 'agenda-eletronica-secret',
     resave: false,
     saveUninitialized: false,
     cookie: {
       maxAge: 1000 * 60 * 60 * 2,
       sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
     },
   })
 );
+
+app.use((req, res, next) => {
+  if (!dbReady && req.path.startsWith('/api')) {
+    return res.status(503).json({ error: 'Banco de dados indisponível. Verifique a variável DATABASE_URL e a conexão com o PostgreSQL.' });
+  }
+  next();
+});
 
 // Verificar status do usuário (bloqueado)
 app.use(checkUserStatus);
@@ -850,10 +891,30 @@ app.post('/api/admin/send-test-email', requireRole('super_admin', 'admin'), asyn
   }
 });
 
+// Rota de fallback para front-end SPA
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
+// Exportar para testes e permitir import sem iniciar o servidor
+module.exports = {
+  app,
+  pool,
+  dbAsync,
+  generateResetToken,
+  isValidPassword,
+  isValidPhone,
+  isValidName,
+  sanitizePhone,
+  sendResetEmail,
+  createAuditLog,
+  initializePg,
+  getCurrentUser,
+  requireRole,
+};
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Servidor rodando em http://localhost:${PORT}`);
+  });
+}
