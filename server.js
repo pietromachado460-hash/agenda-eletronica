@@ -5,6 +5,8 @@ const helmet = require('helmet');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const session = require('express-session');
+const cookieParser = require('cookie-parser');
+const csurf = require('csurf');
 const multer = require('multer');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
@@ -96,6 +98,14 @@ async function initializePg() {
       }
     }
 
+    // Adicionar colunas de segurança (tentativas de login / bloqueio)
+    try {
+      await pool.query("ALTER TABLE users ADD COLUMN failed_attempts INTEGER DEFAULT 0");
+    } catch (err) {}
+    try {
+      await pool.query("ALTER TABLE users ADD COLUMN locked_until TEXT");
+    } catch (err) {}
+
     // Criar tabela de clientes
     await pool.query(`CREATE TABLE IF NOT EXISTS clients (
       id TEXT PRIMARY KEY,
@@ -145,7 +155,15 @@ async function initializePg() {
 
 initializePg();
 
-app.use(helmet({ contentSecurityPolicy: false }));
+// Helmet com CSP básica (melhorar conforme domínio em produção)
+const cspDirectives = {
+  defaultSrc: ["'self'"],
+  scriptSrc: ["'self'", "'unsafe-inline'"],
+  styleSrc: ["'self'", "'unsafe-inline'"],
+  imgSrc: ["'self'", 'data:'],
+  connectSrc: ["'self'"],
+};
+app.use(helmet({ contentSecurityPolicy: { directives: cspDirectives } }));
 app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -153,6 +171,9 @@ app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
 });
+
+app.use(cookieParser());
+
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -163,18 +184,45 @@ const apiLimiter = rateLimit({
 });
 app.use('/api', apiLimiter);
 
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || 'agenda-eletronica-secret',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      maxAge: 1000 * 60 * 60 * 2,
-      sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
-    },
-  })
-);
+// Rate limiters específicos
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Muitas tentativas de login. Tente novamente mais tarde.' } });
+const forgotLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Muitas solicitações de recuperação. Tente novamente mais tarde.' } });
+
+// Configurar session store (Redis se REDIS_URL presente, caso contrário fallback em memória)
+let sessionOptions = {
+  secret: process.env.SESSION_SECRET || 'agenda-eletronica-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 2,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+  },
+};
+
+if (process.env.REDIS_URL) {
+  try {
+    const RedisStore = require('connect-redis')(session);
+    const Redis = require('ioredis');
+    const redisClient = new Redis(process.env.REDIS_URL);
+    sessionOptions.store = new RedisStore({ client: redisClient });
+    console.log('Session store: Redis configurado.');
+  } catch (err) {
+    console.warn('Não foi possível configurar Redis session store, usando fallback em memória.', err.message);
+  }
+}
+
+app.use(session(sessionOptions));
+
+// CSRF protection for API (use double-submit cookie via endpoint)
+try {
+  app.use(csurf({ cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' } }));
+  app.get('/api/csrf-token', (req, res) => {
+    res.json({ csrfToken: req.csrfToken() });
+  });
+} catch (err) {
+  console.warn('CSRF middleware not initialized:', err.message);
+}
 
 app.use((req, res, next) => {
   if (!dbReady && req.path.startsWith('/api')) {
@@ -257,6 +305,39 @@ function requireRole(...rolesPermitidas) {
       return res.status(403).json({ error: 'Permissão negada.' });
     }
     
+    req.user = user;
+    next();
+  };
+}
+
+// Mapa de permissões por ação (RBAC simples)
+const rolePermissions = {
+  super_admin: [
+    'manage_users', 'change_roles', 'view_audit', 'manage_clients', 'export_data', 'import_data'
+  ],
+  admin: ['manage_users', 'manage_clients', 'export_data', 'import_data', 'view_audit'],
+  gerente: ['manage_clients', 'view_reports'],
+  funcionario: ['manage_clients'],
+};
+
+function hasPermission(role, action) {
+  const perms = rolePermissions[role] || [];
+  return perms.includes(action);
+}
+
+function requirePermission(action) {
+  return async (req, res, next) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Não autenticado.' });
+    const user = await dbAsync.get('SELECT id, role, bloqueado FROM users WHERE id = $1', [req.session.userId]);
+    if (!user) return res.status(401).json({ error: 'Usuário não encontrado.' });
+    if (user.bloqueado) {
+      req.session.destroy();
+      return res.status(403).json({ error: 'Sua conta foi bloqueada.' });
+    }
+    if (!hasPermission(user.role, action)) {
+      await createAuditLog(req.session.userId, 'acesso_negado', action, `Tentativa de acesso sem permissão: ${action}`, req);
+      return res.status(403).json({ error: 'Permissão negada.' });
+    }
     req.user = user;
     next();
   };
@@ -409,16 +490,47 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const normalizedPhone = sanitizePhone(telefone);
-    const user = await dbAsync.get('SELECT id, nome, telefone, password FROM users WHERE telefone = $1', [normalizedPhone]);
+    const user = await dbAsync.get('SELECT id, nome, telefone, password, bloqueado, failed_attempts, locked_until FROM users WHERE telefone = $1', [normalizedPhone]);
     console.log('LOGIN LOOKUP', { normalizedPhone, userFound: Boolean(user) });
     if (!user) {
       return res.status(401).json({ error: 'Telefone ou senha inválidos.' });
     }
 
+    // Checar bloqueio por tentativas
+    if (user && user.locked_until) {
+      const until = new Date(user.locked_until);
+      if (!Number.isNaN(until.getTime()) && until > new Date()) {
+        return res.status(403).json({ error: 'Conta temporariamente bloqueada devido a múltiplas tentativas. Tente mais tarde.' });
+      }
+    }
+
     const passwordMatch = await bcrypt.compare(senha, user.password);
     console.log('PASSWORD MATCH', passwordMatch);
     if (!passwordMatch) {
+      // Incrementar tentativas
+      try {
+        const attempts = (user.failed_attempts || 0) + 1;
+        if (attempts >= 5) {
+          const lockUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 min
+          await dbAsync.run('UPDATE users SET failed_attempts = 0, locked_until = $1 WHERE id = $2', [lockUntil, user.id]);
+        } else {
+          await dbAsync.run('UPDATE users SET failed_attempts = $1 WHERE id = $2', [attempts, user.id]);
+        }
+      } catch (e) {
+        console.error('Erro atualizando tentativas de login:', e);
+      }
       return res.status(401).json({ error: 'Telefone ou senha inválidos.' });
+    }
+
+    if (user.bloqueado) {
+      return res.status(403).json({ error: 'Conta bloqueada. Contate o administrador.' });
+    }
+
+    // Resetar tentativas em sucesso
+    try {
+      await dbAsync.run('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = $1', [user.id]);
+    } catch (e) {
+      console.error('Erro resetando tentativas:', e);
     }
 
     req.session.userId = user.id;
@@ -697,7 +809,7 @@ app.post('/api/clients/import', requireAuth, upload.single('file'), async (req, 
 });
 
 app.post(
-  '/api/admin/users/:userId/block',
+  '/api/clients',
   requireAuth,
   [
     body('nome')
@@ -880,11 +992,12 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
     
     const token = generateResetToken();
+    const tokenHash = require('crypto').createHash('sha256').update(token).digest('hex');
     const expiresAt = new Date(Date.now() + 1000 * 60 * 60).toISOString(); // 1 hora
-    
+
     await dbAsync.run(
       'INSERT INTO password_reset_tokens (userId, token, expiresAt, criadoEm) VALUES ($1, $2, $3, $4)',
-      [user.id, token, expiresAt, new Date().toISOString()]
+      [user.id, tokenHash, expiresAt, new Date().toISOString()]
     );
     
     // Enviar email de reset (ou log se SMTP não configurado)
@@ -922,9 +1035,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
       });
     }
     
+    const tokenHash = require('crypto').createHash('sha256').update(token).digest('hex');
     const resetToken = await dbAsync.get(
       'SELECT userId FROM password_reset_tokens WHERE token = $1 AND usado = false AND expiresAt > $2',
-      [token, new Date().toISOString()]
+      [tokenHash, new Date().toISOString()]
     );
     
     if (!resetToken) {
@@ -933,7 +1047,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     
     const novoHash = await bcrypt.hash(novaSenha, 10);
     await dbAsync.run('UPDATE users SET password = $1 WHERE id = $2', [novoHash, resetToken.userId]);
-    await dbAsync.run('UPDATE password_reset_tokens SET usado = true WHERE token = $1', [token]);
+    await dbAsync.run('UPDATE password_reset_tokens SET usado = true WHERE token = $1', [tokenHash]);
     
     await createAuditLog(resetToken.userId, 'reset_senha', 'usuario', 'Senha resetada via token', req);
 
@@ -1012,6 +1126,69 @@ app.post('/api/admin/users/:userId/unblock', requireRole('super_admin'), async (
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Erro ao desbloquear usuário.' });
+  }
+});
+
+// Ativar usuário (Admin e Super Admin)
+app.post('/api/admin/users/:userId/activate', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = await dbAsync.get('SELECT nome FROM users WHERE id = $1', [userId]);
+    if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+    await dbAsync.run('UPDATE users SET ativo = true, data_desbloqueio = $1 WHERE id = $2', [new Date().toISOString(), userId]);
+    await createAuditLog(req.session.userId, 'ativar_usuario', 'usuario', `Usuário ${user.nome} ativado`, req);
+    res.json({ ok: true, mensagem: 'Usuário ativado com sucesso.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao ativar usuário.' });
+  }
+});
+
+// Desativar usuário (Admin e Super Admin)
+app.post('/api/admin/users/:userId/deactivate', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { motivo } = req.body;
+    const user = await dbAsync.get('SELECT nome FROM users WHERE id = $1', [userId]);
+    if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+    await dbAsync.run('UPDATE users SET ativo = false, motivo_bloqueio = $1, data_bloqueio = $2 WHERE id = $3', [motivo || 'Desativado pelo administrador', new Date().toISOString(), userId]);
+    await createAuditLog(req.session.userId, 'desativar_usuario', 'usuario', `Usuário ${user.nome} desativado. Motivo: ${motivo}`, req);
+    res.json({ ok: true, mensagem: 'Usuário desativado com sucesso.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao desativar usuário.' });
+  }
+});
+
+// Alteração de senha pelo administrador (Super Admin e Admin)
+app.post('/api/admin/users/:userId/change-password', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { novaSenha } = req.body;
+    if (!novaSenha || !isStrongPassword(novaSenha)) {
+      return res.status(400).json({ error: 'Senha inválida ou fraca.' });
+    }
+    const user = await dbAsync.get('SELECT nome FROM users WHERE id = $1', [userId]);
+    if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+    const novoHash = await bcrypt.hash(novaSenha, 10);
+    await dbAsync.run('UPDATE users SET password = $1 WHERE id = $2', [novoHash, userId]);
+    await createAuditLog(req.session.userId, 'admin_change_password', 'usuario', `Senha alterada pelo admin para ${user.nome}`, req);
+    res.json({ ok: true, mensagem: 'Senha alterada com sucesso.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao alterar senha do usuário.' });
+  }
+});
+
+// Histórico do usuário (logs) - Admin e Super Admin
+app.get('/api/admin/users/:userId/history', requireRole('super_admin', 'admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const logs = await dbAsync.all('SELECT * FROM audit_logs WHERE userId = $1 ORDER BY criadoEm DESC LIMIT 1000', [userId]);
+    res.json(logs);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar histórico do usuário.' });
   }
 });
 

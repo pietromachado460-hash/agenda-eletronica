@@ -157,13 +157,18 @@ function togglePasswordVisibility(event) {
   button.textContent = isPassword ? 'Ocultar' : 'Mostrar';
 }
 
+let CSRF_TOKEN = null;
+
 async function safeFetch(path, options = {}) {
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(options.headers || {}),
+  };
+  if (CSRF_TOKEN) headers['X-CSRF-Token'] = CSRF_TOKEN;
+
   const response = await fetch(`${API_BASE}${path}`, {
     credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
+    headers,
     ...options,
   });
 
@@ -182,6 +187,17 @@ async function safeFetch(path, options = {}) {
 
 async function loadSession() {
   try {
+    // Buscar CSRF token primeiro
+    try {
+      const tokenResp = await fetch(`${API_BASE}/csrf-token`, { credentials: 'include' });
+      if (tokenResp.ok) {
+        const json = await tokenResp.json();
+        CSRF_TOKEN = json.csrfToken;
+      }
+    } catch (e) {
+      console.warn('Não foi possível obter CSRF token:', e.message);
+    }
+
     const user = await safeFetch('/auth/me', { method: 'GET' });
     currentUser = user;
     currentUserName.textContent = user.nome;
@@ -379,29 +395,61 @@ async function loadAdminUsers() {
       };
 
       const row = document.createElement('tr');
-      row.innerHTML = `
-        <td>${user.nome}</td>
-        <td>${user.email || '—'}</td>
-        <td>${user.telefone}</td>
-        <td><span style="color: ${roleColors[user.role] || '#94a3b8'}">${user.role.toUpperCase()}</span></td>
-        <td>
-          <span class="status-badge ${user.bloqueado ? 'status-blocked' : 'status-active'}">
-            ${user.bloqueado ? '🔒 Bloqueado' : '✓ Ativo'}
-          </span>
-        </td>
-        <td>
-          <div class="action-buttons">
-            ${user.role !== 'super_admin' ? `
-              <button class="btn-icon btn-block-user" data-userid="${user.id}" data-blocked="${user.bloqueado}">
-                ${user.bloqueado ? '🔓 Desbloquear' : '🔒 Bloquear'}
-              </button>
-            ` : ''}
-            ${currentUser.role === 'super_admin' && user.role !== 'super_admin' ? `
-              <button class="btn-icon btn-change-role" data-userid="${user.id}">⚡ Cargo</button>
-            ` : ''}
-          </div>
-        </td>
-      `;
+      const tdNome = document.createElement('td');
+      tdNome.textContent = user.nome;
+      const tdEmail = document.createElement('td');
+      tdEmail.textContent = user.email || '—';
+      const tdTelefone = document.createElement('td');
+      tdTelefone.textContent = user.telefone;
+      const tdRole = document.createElement('td');
+      const spanRole = document.createElement('span');
+      spanRole.style.color = roleColors[user.role] || '#94a3b8';
+      spanRole.textContent = user.role ? user.role.toUpperCase() : '—';
+      tdRole.appendChild(spanRole);
+      const tdStatus = document.createElement('td');
+      const spanStatus = document.createElement('span');
+      spanStatus.className = `status-badge ${user.bloqueado ? 'status-blocked' : 'status-active'}`;
+      spanStatus.textContent = user.bloqueado ? '🔒 Bloqueado' : '✓ Ativo';
+      tdStatus.appendChild(spanStatus);
+      const tdActions = document.createElement('td');
+      const actionDiv = document.createElement('div');
+      actionDiv.className = 'action-buttons';
+      if (user.role !== 'super_admin') {
+        const btnBlock = document.createElement('button');
+        btnBlock.className = 'btn-icon btn-block-user';
+        btnBlock.setAttribute('data-userid', String(user.id));
+        btnBlock.setAttribute('data-blocked', String(user.bloqueado));
+        btnBlock.textContent = user.bloqueado ? '🔓 Desbloquear' : '🔒 Bloquear';
+        actionDiv.appendChild(btnBlock);
+      }
+      // Ativar / Desativar (admin ou super_admin)
+      if (currentUser.role === 'super_admin' || currentUser.role === 'admin') {
+        const btnToggleActive = document.createElement('button');
+        btnToggleActive.className = 'btn-icon btn-toggle-active';
+        btnToggleActive.setAttribute('data-userid', String(user.id));
+        btnToggleActive.textContent = user.ativo === false ? '🔓 Ativar' : '🔒 Desativar';
+        actionDiv.appendChild(btnToggleActive);
+
+        const btnAdminPwd = document.createElement('button');
+        btnAdminPwd.className = 'btn-icon btn-admin-change-pwd';
+        btnAdminPwd.setAttribute('data-userid', String(user.id));
+        btnAdminPwd.textContent = '🔑 Alterar senha';
+        actionDiv.appendChild(btnAdminPwd);
+      }
+      if (currentUser.role === 'super_admin' && user.role !== 'super_admin') {
+        const btnRole = document.createElement('button');
+        btnRole.className = 'btn-icon btn-change-role';
+        btnRole.setAttribute('data-userid', String(user.id));
+        btnRole.textContent = '⚡ Cargo';
+        actionDiv.appendChild(btnRole);
+      }
+      tdActions.appendChild(actionDiv);
+      row.appendChild(tdNome);
+      row.appendChild(tdEmail);
+      row.appendChild(tdTelefone);
+      row.appendChild(tdRole);
+      row.appendChild(tdStatus);
+      row.appendChild(tdActions);
 
       adminUsersTableBody.appendChild(row);
     });
@@ -540,21 +588,42 @@ async function fetchClients() {
 }
 
 function createRow(client) {
-  const row = document.createElement('tr');
-  row.innerHTML = `
-    <td>${client.nome}</td>
-    <td>${client.cpf}</td>
-    <td>${client.telefone}</td>
-    <td>${client.dataNegocio}</td>
-    <td>${client.observacoes || '—'}</td>
-    <td>
-      <div class="action-buttons">
-        <button type="button" class="btn-icon btn-edit" data-action="edit" data-id="${client.id}">Editar</button>
-        <button type="button" class="btn-icon btn-delete" data-action="delete" data-id="${client.id}">Excluir</button>
-      </div>
-    </td>
-  `;
-  return row;
+    const row = document.createElement('tr');
+    const tdNome = document.createElement('td');
+    tdNome.textContent = client.nome;
+    const tdCpf = document.createElement('td');
+    tdCpf.textContent = client.cpf;
+    const tdTelefone = document.createElement('td');
+    tdTelefone.textContent = client.telefone;
+    const tdData = document.createElement('td');
+    tdData.textContent = client.dataNegocio;
+    const tdObs = document.createElement('td');
+    tdObs.textContent = client.observacoes || '—';
+    const tdActions = document.createElement('td');
+    const actionDiv = document.createElement('div');
+    actionDiv.className = 'action-buttons';
+    const btnEdit = document.createElement('button');
+    btnEdit.type = 'button';
+    btnEdit.className = 'btn-icon btn-edit';
+    btnEdit.setAttribute('data-action', 'edit');
+    btnEdit.setAttribute('data-id', client.id);
+    btnEdit.textContent = 'Editar';
+    const btnDelete = document.createElement('button');
+    btnDelete.type = 'button';
+    btnDelete.className = 'btn-icon btn-delete';
+    btnDelete.setAttribute('data-action', 'delete');
+    btnDelete.setAttribute('data-id', client.id);
+    btnDelete.textContent = 'Excluir';
+    actionDiv.appendChild(btnEdit);
+    actionDiv.appendChild(btnDelete);
+    tdActions.appendChild(actionDiv);
+    row.appendChild(tdNome);
+    row.appendChild(tdCpf);
+    row.appendChild(tdTelefone);
+    row.appendChild(tdData);
+    row.appendChild(tdObs);
+    row.appendChild(tdActions);
+    return row;
 }
 
 function updateFormState(isEditing) {
@@ -807,6 +876,8 @@ adminTabs.forEach((tab) => {
 adminUsersTableBody.addEventListener('click', async (event) => {
   const blockBtn = event.target.closest('.btn-block-user');
   const roleBtn = event.target.closest('.btn-change-role');
+  const toggleActiveBtn = event.target.closest('.btn-toggle-active');
+  const adminPwdBtn = event.target.closest('.btn-admin-change-pwd');
 
   if (blockBtn) {
     const userId = blockBtn.dataset.userid;
@@ -818,7 +889,51 @@ adminUsersTableBody.addEventListener('click', async (event) => {
     const userId = roleBtn.dataset.userid;
     await handleChangeRole(parseInt(userId));
   }
+
+  if (toggleActiveBtn) {
+    const userId = toggleActiveBtn.dataset.userid;
+    await handleToggleActive(parseInt(userId));
+  }
+
+  if (adminPwdBtn) {
+    const userId = adminPwdBtn.dataset.userid;
+    await handleAdminChangePassword(parseInt(userId));
+  }
 });
+
+async function handleToggleActive(userId) {
+  const confirmMsg = confirm('Deseja alternar status ativo/desativado deste usuário?');
+  if (!confirmMsg) return;
+  try {
+    // Primeiro obter usuário para saber estado atual
+    const users = await safeFetch('/admin/users', { method: 'GET' });
+    const u = users.find((x) => String(x.id) === String(userId));
+    if (!u) throw new Error('Usuário não encontrado');
+    if (u.ativo === false) {
+      await safeFetch(`/admin/users/${userId}/activate`, { method: 'POST' });
+      showAlert('Usuário ativado.');
+    } else {
+      const motivo = prompt('Motivo da desativação:');
+      if (motivo === null) return;
+      await safeFetch(`/admin/users/${userId}/deactivate`, { method: 'POST', body: JSON.stringify({ motivo }) });
+      showAlert('Usuário desativado.');
+    }
+    loadAdminUsers();
+  } catch (err) {
+    showAlert('Erro: ' + err.message);
+  }
+}
+
+async function handleAdminChangePassword(userId) {
+  const nova = prompt('Digite a nova senha para o usuário (8+ caracteres):');
+  if (!nova) return;
+  try {
+    await safeFetch(`/admin/users/${userId}/change-password`, { method: 'POST', body: JSON.stringify({ novaSenha: nova }) });
+    showAlert('Senha alterada com sucesso.');
+  } catch (err) {
+    showAlert('Erro: ' + err.message);
+  }
+}
 
 function updateSearchPlaceholder() {
   const labels = {
