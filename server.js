@@ -2,10 +2,15 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express');
 const helmet = require('helmet');
+const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const session = require('express-session');
+const multer = require('multer');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
+const { body, query, validationResult } = require('express-validator');
+const { parse } = require('csv-parse/sync');
+const ExcelJS = require('exceljs');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -18,6 +23,8 @@ const pool = new Pool({
 
 // Estado de disponibilidade do DB (permite iniciar servidor mesmo sem conexão)
 let dbReady = true;
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const dbAsync = {
   async get(sql, params = []) {
@@ -139,20 +146,9 @@ async function initializePg() {
 initializePg();
 
 app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use((req, res, next) => {
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
@@ -207,6 +203,14 @@ function isValidPhone(telefone) {
 
 function isValidPassword(senha) {
   return typeof senha === 'string' && senha.length >= 6 && senha.length <= 128;
+}
+
+function handleValidationErrors(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array().map((item) => item.msg).join(', ') });
+  }
+  next();
 }
 
 function requireAuth(req, res, next) {
@@ -447,6 +451,50 @@ app.get('/api/auth/me', async (req, res) => {
   res.json(user);
 });
 
+app.put(
+  '/api/auth/me',
+  requireAuth,
+  [
+    body('nome')
+      .optional()
+      .trim()
+      .isLength({ min: 3, max: 60 })
+      .withMessage('Nome deve ter entre 3 e 60 caracteres.')
+      .matches(/^[A-Za-zÀ-ÿ ]+$/)
+      .withMessage('Nome inválido.'),
+    body('email').optional().trim().isEmail().withMessage('Email inválido.').normalizeEmail(),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { nome, email } = req.body;
+      const updateFields = [];
+      const params = [];
+
+      if (nome) {
+        updateFields.push('nome = $' + (params.length + 1));
+        params.push(nome);
+      }
+      if (email) {
+        updateFields.push('email = $' + (params.length + 1));
+        params.push(email);
+      }
+
+      if (!updateFields.length) {
+        return res.status(400).json({ error: 'Nenhum campo para atualizar.' });
+      }
+
+      params.push(req.session.userId);
+      await dbAsync.run(`UPDATE users SET ${updateFields.join(', ')} WHERE id = $${params.length}`, params);
+      const updatedUser = await dbAsync.get('SELECT id, nome, telefone, email, role, bloqueado FROM users WHERE id = $1', [req.session.userId]);
+      res.json(updatedUser);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Erro ao atualizar perfil.' });
+    }
+  }
+);
+
 app.get('/api/clients', requireAuth, async (req, res) => {
   try {
     const search = String(req.query.search || '').trim().toLowerCase();
@@ -496,89 +544,267 @@ app.get('/api/clients', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/clients', requireAuth, async (req, res) => {
+app.get('/api/clients/stats', requireAuth, async (req, res) => {
   try {
-    const { nome, cpf, telefone, dataNegocio, observacoes } = req.body;
-
-    if (!nome || !cpf || !telefone || !dataNegocio) {
-      return res.status(400).json({ error: 'Nome, CPF, telefone e data do negócio são obrigatórios.' });
+    const clients = await dbAsync.all('SELECT dataNegocio FROM clients WHERE userId = $1', [req.session.userId]);
+    const now = new Date();
+    const labels = [];
+    const counts = [];
+    for (let i = 11; i >= 0; i -= 1) {
+      const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      labels.push(date.toLocaleString('pt-BR', { month: 'short', year: 'numeric' }));
+      counts.push(0);
     }
 
-    if (!isValidName(nome)) {
-      return res.status(400).json({ error: 'Nome inválido. Use apenas letras e espaços.' });
-    }
+    clients.forEach((client) => {
+      const date = new Date(client.dataNegocio);
+      if (Number.isNaN(date.getTime())) {
+        return;
+      }
+      const monthIndex = (date.getFullYear() - now.getFullYear()) * 12 + date.getMonth() - now.getMonth() + 11;
+      if (monthIndex >= 0 && monthIndex < counts.length) {
+        counts[monthIndex] += 1;
+      }
+    });
 
-    if (!/\d{11}/.test(String(cpf).replace(/\D/g, ''))) {
-      return res.status(400).json({ error: 'CPF inválido. Deve conter 11 dígitos.' });
-    }
-
-    if (!isValidPhone(telefone)) {
-      return res.status(400).json({ error: 'Telefone inválido. Deve conter 10 ou 11 dígitos.' });
-    }
-
-    const clientId = `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
-    await dbAsync.run(
-      'INSERT INTO clients (id, userId, nome, cpf, telefone, dataNegocio, observacoes, criadoEm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-      [
-        clientId,
-        req.session.userId,
-        nome.trim(),
-        cpf.trim(),
-        telefone.trim(),
-        dataNegocio.trim(),
-        (observacoes || '').trim(),
-        new Date().toISOString(),
-      ]
-    );
-
-    const newClient = await dbAsync.get('SELECT * FROM clients WHERE id = $1 AND userId = $2', [clientId, req.session.userId]);
-    res.status(201).json(newClient);
- } catch (error) {
-  console.error('CLIENT ERROR:', error);
-  res.status(500).json({
-    error: 'Erro ao salvar cliente.',
-    details: error.message
-  });
-}
-});
-
-app.put('/api/clients/:id', requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { nome, cpf, telefone, dataNegocio, observacoes } = req.body;
-
-    if (!nome || !cpf || !telefone || !dataNegocio) {
-      return res.status(400).json({ error: 'Nome, CPF, telefone e data do negócio são obrigatórios.' });
-    }
-
-    if (!isValidName(nome)) {
-      return res.status(400).json({ error: 'Nome inválido. Use apenas letras e espaços.' });
-    }
-
-    if (!/\d{11}/.test(String(cpf).replace(/\D/g, ''))) {
-      return res.status(400).json({ error: 'CPF inválido. Deve conter 11 dígitos.' });
-    }
-
-    if (!isValidPhone(telefone)) {
-      return res.status(400).json({ error: 'Telefone inválido. Deve conter 10 ou 11 dígitos.' });
-    }
-
-    const existing = await dbAsync.get('SELECT id FROM clients WHERE id = $1 AND userId = $2', [id, req.session.userId]);
-    if (!existing) {
-      return res.status(404).json({ error: 'Cliente não encontrado.' });
-    }
-    await dbAsync.run(
-      'UPDATE clients SET nome = $1, cpf = $2, telefone = $3, dataNegocio = $4, observacoes = $5, atualizadoEm = $6 WHERE id = $7 AND userId = $8',
-      [nome.trim(), cpf.trim(), telefone.trim(), dataNegocio.trim(), (observacoes || '').trim(), new Date().toISOString(), id, req.session.userId]
-    );
-
-    const updatedClient = await dbAsync.get('SELECT * FROM clients WHERE id = $1 AND userId = $2', [id, req.session.userId]);
-    res.json(updatedClient);
+    res.json({
+      totalClients: clients.length,
+      labels,
+      counts,
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Erro ao atualizar cliente.' });
+    res.status(500).json({ error: 'Erro ao carregar estatísticas de clientes.' });
   }
 });
+
+app.get('/api/clients/export/csv', requireAuth, async (req, res) => {
+  try {
+    const clients = await dbAsync.all('SELECT nome, cpf, telefone, dataNegocio, observacoes FROM clients WHERE userId = $1 ORDER BY criadoEm DESC', [req.session.userId]);
+    const rows = clients.map((client) => [client.nome, client.cpf, client.telefone, client.dataNegocio, client.observacoes || '']);
+    const header = ['Nome', 'CPF', 'Telefone', 'DataNegocio', 'Observacoes'];
+    const csv = [header.join(','), ...rows.map((row) => row.map((value) => `"${String(value || '').replace(/"/g, '""')}"`).join(','))].join('\r\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="clientes_export.csv"');
+    res.send('\uFEFF' + csv);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao exportar clientes em CSV.' });
+  }
+});
+
+app.get('/api/clients/export/xlsx', requireAuth, async (req, res) => {
+  try {
+    const clients = await dbAsync.all('SELECT nome, cpf, telefone, dataNegocio, observacoes FROM clients WHERE userId = $1 ORDER BY criadoEm DESC', [req.session.userId]);
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Clientes');
+    sheet.columns = [
+      { header: 'Nome', key: 'nome', width: 40 },
+      { header: 'CPF', key: 'cpf', width: 20 },
+      { header: 'Telefone', key: 'telefone', width: 20 },
+      { header: 'DataNegocio', key: 'dataNegocio', width: 20 },
+      { header: 'Observacoes', key: 'observacoes', width: 50 },
+    ];
+    clients.forEach((client) => {
+      sheet.addRow({
+        nome: client.nome,
+        cpf: client.cpf,
+        telefone: client.telefone,
+        dataNegocio: client.dataNegocio,
+        observacoes: client.observacoes || '',
+      });
+    });
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="clientes_export.xlsx"');
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao exportar clientes em XLSX.' });
+  }
+});
+
+app.post('/api/clients/import', requireAuth, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Arquivo de importação não fornecido.' });
+    }
+
+    const ext = String(req.file.originalname || '').toLowerCase();
+    const rows = [];
+    if (ext.endsWith('.csv')) {
+      const csvText = req.file.buffer.toString('utf8');
+      const records = parse(csvText, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+      });
+      records.forEach((record) => rows.push(record));
+    } else if (ext.endsWith('.xlsx') || ext.endsWith('.xls')) {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(req.file.buffer);
+      const worksheet = workbook.worksheets[0];
+      const headerRow = worksheet.getRow(1);
+      const header = headerRow.values.slice(1).map((cell) => String(cell || '').trim().toLowerCase());
+      worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+        if (rowNumber === 1) return;
+        const record = {};
+        header.forEach((key, index) => {
+          record[key] = row.getCell(index + 1).value || '';
+        });
+        rows.push(record);
+      });
+    } else {
+      return res.status(400).json({ error: 'Tipo de arquivo não suportado. Use CSV ou XLSX.' });
+    }
+
+    const report = { total: rows.length, inserted: 0, skipped: 0, errors: [] };
+
+    for (const [index, record] of rows.entries()) {
+      const nome = String(record.nome || record.name || '').trim();
+      const cpf = String(record.cpf || record.CPF || '').trim();
+      const telefone = String(record.telefone || record.phone || '').trim();
+      const dataNegocio = String(record.dataNegocio || record.data || record['data negocio'] || '').trim();
+      const observacoes = String(record.observacoes || record.notes || record.observations || '').trim();
+
+      if (!isValidName(nome) || !/\d{11}/.test(cpf.replace(/\D/g, '')) || !isValidPhone(telefone) || !dataNegocio) {
+        report.skipped += 1;
+        report.errors.push({ row: index + 2, reason: 'Dados inválidos ou incompletos.' });
+        continue;
+      }
+
+      const clientId = `${Date.now()}-${Math.floor(Math.random() * 100000)}-${index}`;
+      try {
+        await dbAsync.run(
+          'INSERT INTO clients (id, userId, nome, cpf, telefone, dataNegocio, observacoes, criadoEm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+          [clientId, req.session.userId, nome, cpf, telefone, dataNegocio, observacoes, new Date().toISOString()]
+        );
+        report.inserted += 1;
+      } catch (err) {
+        report.skipped += 1;
+        report.errors.push({ row: index + 2, reason: err.message });
+      }
+    }
+
+    await createAuditLog(req.session.userId, 'importar_clientes', 'cliente', `Importação de clientes: ${report.inserted} inseridos, ${report.skipped} ignorados`, req);
+    res.json(report);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao importar clientes.' });
+  }
+});
+
+app.post(
+  '/api/admin/users/:userId/block',
+  requireAuth,
+  [
+    body('nome')
+      .trim()
+      .isLength({ min: 3, max: 60 })
+      .withMessage('Nome deve ter entre 3 e 60 caracteres.')
+      .matches(/^[A-Za-zÀ-ÿ ]+$/)
+      .withMessage('Nome inválido.'),
+    body('cpf')
+      .trim()
+      .matches(/^\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11}$/)
+      .withMessage('CPF inválido. Deve conter 11 dígitos.'),
+    body('telefone')
+      .trim()
+      .custom((value) => {
+        const digits = String(value || '').replace(/\D/g, '');
+        return digits.length === 10 || digits.length === 11;
+      })
+      .withMessage('Telefone inválido. Deve conter 10 ou 11 dígitos.'),
+    body('dataNegocio')
+      .trim()
+      .notEmpty()
+      .withMessage('Data do negócio é obrigatória.'),
+    body('observacoes').optional().trim(),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { nome, cpf, telefone, dataNegocio, observacoes } = req.body;
+
+      const clientId = `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+      await dbAsync.run(
+        'INSERT INTO clients (id, userId, nome, cpf, telefone, dataNegocio, observacoes, criadoEm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+        [
+          clientId,
+          req.session.userId,
+          nome.trim(),
+          cpf.trim(),
+          telefone.trim(),
+          dataNegocio.trim(),
+          (observacoes || '').trim(),
+          new Date().toISOString(),
+        ]
+      );
+
+      const newClient = await dbAsync.get('SELECT * FROM clients WHERE id = $1 AND userId = $2', [clientId, req.session.userId]);
+      res.status(201).json(newClient);
+    } catch (error) {
+      console.error('CLIENT ERROR:', error);
+      res.status(500).json({
+        error: 'Erro ao salvar cliente.',
+        details: error.message,
+      });
+    }
+  }
+);
+
+app.put(
+  '/api/clients/:id',
+  requireAuth,
+  [
+    body('nome')
+      .trim()
+      .isLength({ min: 3, max: 60 })
+      .withMessage('Nome deve ter entre 3 e 60 caracteres.')
+      .matches(/^[A-Za-zÀ-ÿ ]+$/)
+      .withMessage('Nome inválido.'),
+    body('cpf')
+      .trim()
+      .matches(/^\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11}$/)
+      .withMessage('CPF inválido. Deve conter 11 dígitos.'),
+    body('telefone')
+      .trim()
+      .custom((value) => {
+        const digits = String(value || '').replace(/\D/g, '');
+        return digits.length === 10 || digits.length === 11;
+      })
+      .withMessage('Telefone inválido. Deve conter 10 ou 11 dígitos.'),
+    body('dataNegocio')
+      .trim()
+      .notEmpty()
+      .withMessage('Data do negócio é obrigatória.'),
+    body('observacoes').optional().trim(),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { nome, cpf, telefone, dataNegocio, observacoes } = req.body;
+
+      const existing = await dbAsync.get('SELECT id FROM clients WHERE id = $1 AND userId = $2', [id, req.session.userId]);
+      if (!existing) {
+        return res.status(404).json({ error: 'Cliente não encontrado.' });
+      }
+      await dbAsync.run(
+        'UPDATE clients SET nome = $1, cpf = $2, telefone = $3, dataNegocio = $4, observacoes = $5, atualizadoEm = $6 WHERE id = $7 AND userId = $8',
+        [nome.trim(), cpf.trim(), telefone.trim(), dataNegocio.trim(), (observacoes || '').trim(), new Date().toISOString(), id, req.session.userId]
+      );
+
+      const updatedClient = await dbAsync.get('SELECT * FROM clients WHERE id = $1 AND userId = $2', [id, req.session.userId]);
+      res.json(updatedClient);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Erro ao atualizar cliente.' });
+    }
+  }
+);
 
 app.delete('/api/clients/:id', requireAuth, async (req, res) => {
   try {
